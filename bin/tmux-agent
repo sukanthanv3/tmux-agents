@@ -1,0 +1,652 @@
+#!/usr/bin/env bash
+#
+# tmux-agent — multi-agent tmux runtime
+#
+# Model:
+#   * `tmux-agent start` creates a session with a generated id and prints it.
+#   * Inside any pane of that session, `tmux-agent new <agent>` registers the
+#     CURRENT pane as <agent> and launches kiro in it.
+#   * The registry is the pane itself: a tmux user option `@agent` on the pane.
+#     Apps cannot overwrite user options (unlike pane titles), pane ids (%N)
+#     never shift, and tmux drops the option when the pane dies.
+#   * Agent-to-agent messages are delivered by pasting into the target pane id.
+
+set -euo pipefail
+
+# Command used to launch an agent. The agent name is appended.
+# Override for testing, e.g. TMUX_AGENT_CMD="bash -c 'cat' --"
+AGENT_CMD="${TMUX_AGENT_CMD:-kiro-cli chat -a --agent}"
+
+# Max panes per window before `spawn` opens a new window.
+MAX_PANES="${TMUX_AGENT_MAX_PANES:-4}"
+
+SESSION=""
+STATE_DIR=""
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+require_tmux() {
+    command -v tmux >/dev/null 2>&1 || die "tmux is not installed"
+}
+
+state_dir_for() {
+    echo "${TMPDIR:-/tmp}/tmux-agent-$1"
+}
+
+is_agent_session() {
+    [[ "$(tmux show-options -t "$1" -qv @tmux_agent 2>/dev/null)" == "1" ]]
+}
+
+# Resolve session: $TMUX_AGENT_SESSION > session of the pane we're in > error
+resolve_session() {
+    require_tmux
+    if [[ -n "${TMUX_AGENT_SESSION:-}" ]]; then
+        SESSION="$TMUX_AGENT_SESSION"
+    elif [[ -n "${TMUX_PANE:-}" ]]; then
+        SESSION="$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}')"
+    else
+        die "Not inside a tmux-agent session. Set TMUX_AGENT_SESSION=<id> or run inside the session."
+    fi
+    tmux has-session -t "=$SESSION" 2>/dev/null ||
+        die "tmux session '$SESSION' does not exist"
+    is_agent_session "$SESSION" ||
+        die "Session '$SESSION' is not a tmux-agent session (create one with: tmux-agent start)"
+    STATE_DIR="$(state_dir_for "$SESSION")"
+    mkdir -p "$STATE_DIR"
+}
+
+validate_name() {
+    [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] ||
+        die "Invalid agent name '$1' (allowed: letters, digits, . _ -)"
+}
+
+# ============================================================
+# REGISTRY — pane user options
+#   @agent        agent name
+#   @agent_state  running
+# ============================================================
+
+pane_for() {
+    tmux list-panes -s -t "=$SESSION" -F '#{pane_id} #{@agent}' |
+        awk -v n="$1" '$2 == n { print $1; exit }'
+}
+
+require_pane_for() {
+    local pane
+    pane="$(pane_for "$1")"
+    [[ -n "$pane" ]] || die "Agent '$1' is not registered in session '$SESSION'"
+    echo "$pane"
+}
+
+self_agent() {
+    [[ -n "${TMUX_PANE:-}" ]] || return 0
+    tmux show-options -p -t "$TMUX_PANE" -qv @agent 2>/dev/null || true
+}
+
+is_running() {
+    local pane
+    pane="$(pane_for "$1")"
+    [[ -n "$pane" ]] &&
+        [[ "$(tmux show-options -p -t "$pane" -qv @agent_state)" == "running" ]]
+}
+
+apply_window_style() {
+    local win="$1"
+    tmux set-option -w -t "$win" pane-border-status top
+    tmux set-option -w -t "$win" pane-border-format \
+        ' #{pane_id} #{?@agent,[#{@agent}],(no agent)} '
+}
+
+# Paste text into a pane using a private buffer + bracketed paste, then Enter.
+deliver() {
+    local pane="$1" text="$2"
+    local buf="tmux-agent-$$-$RANDOM"
+    printf '%s' "$text" | tmux load-buffer -b "$buf" -
+    tmux paste-buffer -b "$buf" -d -p -t "$pane"
+    sleep 0.2
+    tmux send-keys -t "$pane" Enter
+}
+
+# ============================================================
+# START — create a session with a single pane, print the id.
+#         Agents get their own panes on demand via `spawn`.
+# ============================================================
+
+cmd_start() {
+    require_tmux
+
+    local id=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name|-n)
+                [[ $# -ge 2 ]] || die "--name requires a value"
+                id="$2"; shift 2 ;;
+            *) die "Unknown option: $1. Usage: tmux-agent start [--name ID]" ;;
+        esac
+    done
+
+    if [[ -z "$id" ]]; then
+        id="ta-$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c 6 || true)"
+    fi
+    validate_name "$id"
+    tmux has-session -t "=$id" 2>/dev/null && die "Session '$id' already exists"
+
+    tmux new-session -d -s "$id"
+    tmux set-option -t "$id" @tmux_agent 1
+    tmux set-environment -t "$id" TMUX_AGENT_SESSION "$id"
+    apply_window_style "$id:"
+
+    mkdir -p "$(state_dir_for "$id")"
+
+    # stdout = session id only (scriptable: id=$(tmux-agent start))
+    echo "$id"
+    {
+        echo
+        echo "Attach : tmux attach -t $id"
+        echo "Then   : tmux-agent new <agent>     (run kiro in this pane)"
+        echo "     or: tmux-agent spawn <agent>   (open a new pane for it)"
+    } >&2
+}
+
+# ============================================================
+# PANE CREATION — open a pane running `tmux-agent new <agent>`
+# ============================================================
+
+# create_agent_pane <agent> <dir> <kiro-agent> [first prompt]  -> prints pane id
+#   Splits the caller's window (or the session's current window from
+#   outside); opens a new window once a window holds $MAX_PANES panes or
+#   there is no room to split. The pane closes when the agent exits.
+create_agent_pane() {
+    local agent="$1" dir="$2" profile="$3"; shift 3
+    local self cmd target pane
+    self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    cmd="$(printf '%q ' "$self" new --agent "$profile" "$agent" "$@")"
+
+    local opts=(-d -P -F '#{pane_id}'
+        -e "TMUX_AGENT_SESSION=$SESSION" -e "TMUX_AGENT_NAME=$agent")
+    [[ -z "${TMUX_AGENT_CMD:-}" ]] || opts+=(-e "TMUX_AGENT_CMD=$TMUX_AGENT_CMD")
+    [[ -z "$dir" ]] || opts+=(-c "$dir")
+
+    target="=$SESSION:"
+    if [[ -n "${TMUX_PANE:-}" ]] &&
+       [[ "$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}')" == "$SESSION" ]]; then
+        target="$TMUX_PANE"
+    fi
+
+    # Prefer the caller's window; otherwise any session window with room.
+    if (( $(tmux display-message -p -t "$target" '#{window_panes}') >= MAX_PANES )); then
+        local w
+        w="$(tmux list-windows -t "=$SESSION" -F '#{window_panes} #{window_id}' |
+            awk -v m="$MAX_PANES" '$1 < m { id = $2 } END { print id }')"
+        [[ -n "$w" ]] && target="$w" || target=""
+    fi
+    if [[ -n "$target" ]] &&
+       pane="$(tmux split-window -t "$target" "${opts[@]}" "$cmd" 2>/dev/null)"; then
+        tmux select-layout -t "$pane" tiled >/dev/null 2>&1 || true
+    else
+        pane="$(tmux new-window -t "=$SESSION:" "${opts[@]}" "$cmd")" ||
+            die "Could not create a pane for '$agent'"
+        apply_window_style "$pane"
+    fi
+
+    # Claim the name immediately so a concurrent spawn can't reuse it.
+    tmux set-option -p -t "$pane" @agent "$agent"
+    tmux set-option -p -t "$pane" @agent_state running
+    tmux set-option -p -t "$pane" @agent_spawned 1
+    echo "$pane"
+}
+
+# ============================================================
+# NEW — register the current pane as <agent> and run kiro in it
+#       (from outside the session: opens a new pane for it)
+# ============================================================
+
+cmd_new() {
+    local dir="" profile=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dir|-d)
+                [[ $# -ge 2 ]] || die "--dir requires a path"
+                dir="${2/#\~/$HOME}"; shift 2 ;;
+            --agent|-a)
+                [[ $# -ge 2 ]] || die "--agent requires a kiro agent name"
+                profile="$2"; shift 2 ;;
+            *) break ;;
+        esac
+    done
+    [[ $# -ge 1 ]] || die "Usage: tmux-agent new [--dir <path>] [--agent <kiro-agent>] <agent> [first prompt]"
+    local agent="$1"; shift
+    validate_name "$agent"
+    [[ -z "$dir" || -d "$dir" ]] || die "Directory does not exist: $dir"
+    profile="${profile:-$agent}"
+
+    resolve_session
+
+    local existing
+    existing="$(pane_for "$agent")"
+
+    # Called from outside this session's panes: create a pane and run there.
+    local here=""
+    if [[ -n "${TMUX_PANE:-}" ]]; then
+        here="$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}')"
+    fi
+    if [[ "$here" != "$SESSION" ]]; then
+        [[ -z "$existing" ]] || die "Agent '$agent' already registered in pane $existing"
+        local pane
+        pane="$(create_agent_pane "$agent" "$dir" "$profile" "$@")"
+        echo "Created agent '$agent' in new pane $pane"
+        return 0
+    fi
+
+    [[ -z "$existing" || "$existing" == "$TMUX_PANE" ]] ||
+        die "Agent '$agent' already registered in pane $existing"
+    if [[ -n "$(self_agent)" && "$(self_agent)" != "$agent" ]]; then
+        die "This pane is already registered as '$(self_agent)'"
+    fi
+
+    # Global (not local): the EXIT trap runs after cmd_new's scope is gone.
+    _TA_PANE="$TMUX_PANE"
+    local pane="$_TA_PANE"
+    unregister() {
+        tmux set-option -p -t "$_TA_PANE" -u @agent 2>/dev/null || true
+        tmux set-option -p -t "$_TA_PANE" -u @agent_state 2>/dev/null || true
+    }
+    trap unregister EXIT
+    # A handler (not ignore) so Ctrl-C reaches kiro but doesn't kill us first;
+    # handlers reset to default in exec'd children.
+    trap ':' INT
+
+    tmux set-option -p -t "$pane" @agent "$agent"
+    tmux set-option -p -t "$pane" @agent_state running
+    tmux set-option -p -t "$pane" @agent_profile "$profile"
+    apply_window_style "$pane"
+
+    export TMUX_AGENT_SESSION="$SESSION" TMUX_AGENT_NAME="$agent"
+    [[ -z "$dir" ]] || cd "$dir"
+
+    echo "Registered '$agent' -> pane $pane (session $SESSION, kiro agent $profile)" >&2
+
+    local rc=0
+    # shellcheck disable=SC2086
+    $AGENT_CMD "$profile" "$@" || rc=$?
+    return $rc
+}
+
+# ============================================================
+# SEND / SPAWN — deliver a message to another agent's pane
+# ============================================================
+
+# Wrap a message with sender info + reply instructions (when sent by an agent).
+format_msg() {
+    local from="$1" msg="$2"
+    if [[ -n "$from" ]]; then
+        msg="[from: $from] $msg
+(Reply with: tmux-agent send $from \"<message>\"  or  tmux-agent notify $from \"<result>\")"
+    fi
+    printf '%s' "$msg"
+}
+
+cmd_send() {
+    [[ $# -ge 2 ]] || die "Usage: tmux-agent send <agent> <message>"
+    local to="$1"; shift
+    resolve_session
+
+    local pane
+    pane="$(require_pane_for "$to")"
+    is_running "$to" || die "Agent '$to' is not running"
+
+    local from
+    from="$(self_agent)"
+    [[ "$from" != "$to" ]] || die "Refusing to send a message to yourself ('$to')"
+
+    deliver "$pane" "$(format_msg "$from" "$*")"
+    echo "sent to $to ($pane)"
+}
+
+# spawn [--dir <path>] [--agent <kiro-agent>] <agent> ["<task>"]
+#   Agent not running -> open a new pane, start kiro there, task = first prompt.
+#   Agent running     -> just send the task to it.
+cmd_spawn() {
+    local dir="" profile=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dir|-d)
+                [[ $# -ge 2 ]] || die "--dir requires a path"
+                dir="${2/#\~/$HOME}"; shift 2 ;;
+            --agent|-a)
+                [[ $# -ge 2 ]] || die "--agent requires a kiro agent name"
+                profile="$2"; shift 2 ;;
+            *) break ;;
+        esac
+    done
+    [[ $# -ge 1 ]] || die "Usage: tmux-agent spawn [--dir <path>] [--agent <kiro-agent>] <agent> [\"<task>\"]"
+    local agent="$1"; shift
+    validate_name "$agent"
+    [[ -z "$dir" || -d "$dir" ]] || die "Directory does not exist: $dir"
+    resolve_session
+
+    local from
+    from="$(self_agent)"
+    [[ "$from" != "$agent" ]] || die "Refusing to spawn yourself ('$agent')"
+
+    if [[ -n "$(pane_for "$agent")" ]]; then
+        [[ -z "$dir" && -z "$profile" ]] ||
+            echo "note: '$agent' already running; --dir/--agent ignored" >&2
+        if [[ $# -ge 1 ]]; then
+            cmd_send "$agent" "$@"
+        else
+            echo "'$agent' already running in pane $(pane_for "$agent")"
+        fi
+        return 0
+    fi
+
+    local args=()
+    [[ $# -eq 0 ]] || args+=("$(format_msg "$from" "$*")")
+    local pane
+    pane="$(create_agent_pane "$agent" "$dir" "${profile:-$agent}" ${args[@]+"${args[@]}"})"
+    echo "spawned $agent ($pane)"
+}
+
+# ============================================================
+# NOTIFY / WAIT / RESULT — tmux wait-for channels
+#   A signal sent before anyone waits is remembered, so notify
+#   never blocks and wait returns immediately if already notified.
+# ============================================================
+
+channel_for() {
+    echo "tmux-agent-$SESSION-$1"
+}
+
+waiter_file() {
+    echo "$STATE_DIR/$1.waiting"
+}
+
+# True if a live `tmux-agent wait` is blocked on <agent>'s channel.
+has_live_waiter() {
+    local f pid
+    f="$(waiter_file "$1")"
+    [[ -f "$f" ]] || return 1
+    pid="$(cat "$f" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+    rm -f "$f"   # stale: waiter was killed (e.g. tool timeout)
+    return 1
+}
+
+# notify <agent> <msg>: deliver a result TO <agent> (normally the requester).
+#   * <agent> blocked in `wait`  -> store result + signal the channel
+#   * <agent> idle at its prompt -> store result + paste it into its pane
+#     (no signal, so a later `wait` doesn't return a stale result)
+#   * <agent> not running        -> store result + signal (picked up by next wait)
+cmd_notify() {
+    [[ $# -ge 2 ]] || die "Usage: tmux-agent notify <agent> <message>"
+    local to="$1"; shift
+    validate_name "$to"
+    resolve_session
+
+    local msg="$*" from
+    from="$(self_agent)"
+    printf '%s\n' "$msg" > "$STATE_DIR/$to.result"
+
+    if has_live_waiter "$to"; then
+        tmux wait-for -S "$(channel_for "$to")"
+        echo "notified $to (woke waiter)"
+        return 0
+    fi
+
+    local pane
+    pane="$(pane_for "$to")"
+    if [[ -n "$pane" ]] && is_running "$to"; then
+        deliver "$pane" "[notify from: ${from:-unknown}] $msg"
+        echo "notified $to (delivered to pane $pane)"
+        return 0
+    fi
+
+    tmux wait-for -S "$(channel_for "$to")"
+    echo "notified $to (not running; stored for next wait/result)" >&2
+}
+
+# wait [agent]: block until <agent> (default: yourself) is notified.
+cmd_wait() {
+    local agent
+    if [[ $# -ge 1 ]]; then agent="$1"; else agent="$(self_agent)"; fi
+    [[ -n "$agent" ]] || die "Usage: tmux-agent wait [agent]"
+    validate_name "$agent"
+    resolve_session
+
+    local wf
+    wf="$(waiter_file "$agent")"
+    echo "$$" > "$wf"
+    # shellcheck disable=SC2064
+    trap "rm -f '$wf'" EXIT
+    trap 'exit 130' INT TERM HUP
+
+    echo "waiting for notify to '$agent'..." >&2
+    tmux wait-for "$(channel_for "$agent")"
+    rm -f "$wf"
+    cat "$STATE_DIR/$agent.result"
+}
+
+cmd_result() {
+    [[ $# -eq 1 ]] || die "Usage: tmux-agent result <agent>"
+    validate_name "$1"
+    resolve_session
+    [[ -f "$STATE_DIR/$1.result" ]] || die "No result for '$1' yet"
+    cat "$STATE_DIR/$1.result"
+}
+
+# ============================================================
+# CAPTURE / STOP
+# ============================================================
+
+cmd_capture() {
+    [[ $# -ge 1 ]] || die "Usage: tmux-agent capture <agent> [lines]"
+    resolve_session
+    local pane
+    pane="$(require_pane_for "$1")"
+    tmux capture-pane -t "$pane" -p -S "-${2:-500}"
+}
+
+# stop [--quit] <agent>
+#   Default: cancel the agent's current response, like pressing Ctrl-C in
+#   its pane. The agent keeps running, stays registered, and its pane stays
+#   open, so it can be sent a new task straight away.
+#   --quit: shut the agent down instead (same as `tmux-agent quit`).
+cmd_stop() {
+    if [[ "${1:-}" == "--quit" ]]; then
+        shift
+        cmd_quit "$@"
+        return
+    fi
+    [[ $# -eq 1 ]] || die "Usage: tmux-agent stop [--quit] <agent>"
+    local agent="$1"
+    resolve_session
+    local pane
+    pane="$(require_pane_for "$agent")"
+    [[ "$(self_agent)" != "$agent" ]] ||
+        die "Refusing to stop yourself ('$agent')"
+
+    tmux send-keys -t "$pane" C-c
+    echo "stopped $agent's current response ($pane); agent still running"
+}
+
+# quit <agent>: exit the agent. A spawned pane closes; the user's own pane
+# is unregistered and returned to its shell.
+cmd_quit() {
+    [[ $# -eq 1 ]] || die "Usage: tmux-agent quit <agent>"
+    local agent="$1"
+    resolve_session
+    local pane
+    pane="$(require_pane_for "$agent")"
+
+    tmux send-keys -t "$pane" "/quit" Enter
+    local i
+    for (( i=0; i<10; i++ )); do
+        [[ -z "$(pane_for "$agent")" ]] && { echo "quit $agent"; return 0; }
+        sleep 0.5
+    done
+
+    # Didn't exit cleanly. Spawned panes are disposable: kill them.
+    if [[ "$(tmux show-options -p -t "$pane" -qv @agent_spawned)" == "1" ]]; then
+        tmux kill-pane -t "$pane"
+        echo "quit $agent (pane $pane killed)"
+        return 0
+    fi
+    # User's own pane: interrupt, then force-unregister (keep their shell).
+    tmux send-keys -t "$pane" C-c
+    sleep 1
+    tmux set-option -p -t "$pane" -u @agent 2>/dev/null || true
+    tmux set-option -p -t "$pane" -u @agent_state 2>/dev/null || true
+    echo "quit $agent (forced unregister)"
+}
+
+# ============================================================
+# AGENTS / STATUS / KILL
+# ============================================================
+
+cmd_agents() {
+    resolve_session
+    {
+        echo "AGENT PANE STATE COMMAND"
+        tmux list-panes -s -t "=$SESSION" \
+            -F '#{?@agent,#{@agent},-} #{pane_id} #{?@agent_state,#{@agent_state},free} #{pane_current_command}'
+    } | column -t
+}
+
+cmd_status() {
+    resolve_session
+    echo "Session : $SESSION"
+    echo "State   : $STATE_DIR"
+    echo
+    cmd_agents
+}
+
+cmd_kill() {
+    require_tmux
+    local id="${1:-}"
+    if [[ -z "$id" ]]; then
+        resolve_session
+        id="$SESSION"
+    fi
+    if tmux has-session -t "=$id" 2>/dev/null; then
+        is_agent_session "$id" || die "Session '$id' is not a tmux-agent session; refusing to kill"
+        tmux kill-session -t "=$id"
+        echo "killed session '$id'"
+    else
+        echo "session '$id' does not exist"
+    fi
+    rm -rf "$(state_dir_for "$id")"
+}
+
+cmd_list() {
+    require_tmux
+    tmux list-sessions -F '#{session_name} #{@tmux_agent} #{session_windows}w #{?session_attached,attached,detached}' 2>/dev/null |
+        awk '$2 == 1 { print $1, $3, $4 }' || true
+}
+
+# List tmux-agent sessions, newest first, with id, creation time and agents.
+cmd_list_sessions() {
+    require_tmux
+    local rows
+    rows="$(tmux list-sessions -F '#{session_created} #{session_name} #{@tmux_agent} #{?session_attached,attached,detached}' 2>/dev/null |
+        awk '$3 == 1 { print $1, $2, $4 }' | sort -rn -k1,1)" || true
+    if [[ -z "$rows" ]]; then
+        echo "No tmux-agent sessions"
+        return 0
+    fi
+
+    local created id state when agents
+    {
+        echo "SESSION_ID CREATED STATE AGENTS"
+        while read -r created id state; do
+            when="$(date -r "$created" '+%Y-%m-%dT%H:%M:%S' 2>/dev/null ||
+                date -d "@$created" '+%Y-%m-%dT%H:%M:%S')"
+            agents="$(tmux list-panes -s -t "=$id" -F '#{@agent}' 2>/dev/null |
+                awk 'NF' | paste -sd, -)"
+            echo "$id $when $state ${agents:--}"
+        done <<< "$rows"
+    } | column -t
+}
+
+# ============================================================
+# HELP / MAIN
+# ============================================================
+
+cmd_help() {
+    cat <<'EOF'
+
+tmux-agent — multi-agent tmux runtime
+
+Session:
+  tmux-agent start [--name ID]               Create a session (one pane), prints its id
+  tmux-agent list                            List tmux-agent sessions
+  tmux-agent list-sessions                   List sessions with id, created time and
+                                             agents, newest first (alias: sessions)
+  tmux-agent kill [ID]                       Kill session (default: current)
+
+Agents (run inside a pane of the session):
+  tmux-agent new [--dir P] [--agent K] <agent> [prompt]
+                                             Register THIS pane as <agent>, start kiro
+                                             (from outside the session: opens a new pane)
+  tmux-agent spawn [--dir P] [--agent K] <agent> ["<task>"]
+                                             Open a NEW pane running <agent> with <task>
+                                             as its first prompt; if <agent> is already
+                                             running, just send it <task>
+                                             (--agent K: kiro agent config, default <agent>)
+  tmux-agent stop <agent>                    Cancel the agent's current response (Ctrl-C);
+                                             the agent and its pane keep running
+  tmux-agent quit <agent>                    Exit the agent; a spawned pane closes
+                                             (also: stop --quit, remove)
+  tmux-agent agents | status                 Show registered panes
+
+Messaging:
+  tmux-agent send <agent> "<message>"        Paste message into agent's pane
+                                             (prefixed with [from: <you>] when sent by an agent)
+  tmux-agent notify <agent> "<result>"       Send result TO <agent>: wakes its `wait`, or
+                                             pastes into its pane if it isn't waiting
+  tmux-agent wait [agent]                    Block until <agent> (default: you) is notified
+  tmux-agent result <agent>                  Re-read last result
+  tmux-agent capture <agent> [lines]         Dump pane output (debug)
+
+Outside the session, set TMUX_AGENT_SESSION=<id>.
+Panes per window before spawn opens a new window: TMUX_AGENT_MAX_PANES (default 4).
+
+Example:
+  id=$(tmux-agent start)
+  tmux attach -t "$id"
+  # first pane:  tmux-agent new coder
+  # coder can now run:  tmux-agent spawn jira "create a ticket for X"
+  #   -> opens a pane for jira; jira starts with that task
+
+EOF
+}
+
+main() {
+    local command="${1:-help}"
+    shift || true
+    case "$command" in
+        start)   cmd_start "$@" ;;
+        list|ls) cmd_list "$@" ;;
+        list-sessions|sessions) cmd_list_sessions "$@" ;;
+        new|register) cmd_new "$@" ;;
+        stop)    cmd_stop "$@" ;;
+        quit|remove)  cmd_quit "$@" ;;
+        agents)  cmd_agents "$@" ;;
+        status)  cmd_status "$@" ;;
+        send)    cmd_send "$@" ;;
+        spawn)   cmd_spawn "$@" ;;
+        notify)  cmd_notify "$@" ;;
+        wait)    cmd_wait "$@" ;;
+        result)  cmd_result "$@" ;;
+        capture) cmd_capture "$@" ;;
+        kill)    cmd_kill "$@" ;;
+        help|-h|--help) cmd_help ;;
+        *) die "Unknown command: $command (see: tmux-agent help)" ;;
+    esac
+}
+
+main "$@"
