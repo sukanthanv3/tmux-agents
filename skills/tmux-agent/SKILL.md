@@ -1,6 +1,6 @@
 ---
 name: tmux-agent
-description: Multi-agent tmux runtime — managing agents, sending tasks, and inter-agent communication
+description: Use when running inside the tmux-agent runtime and a task needs a tool or capability you don't have (e.g. Jira, gdev, terraform) — spawn or message the agent that has it instead of asking the user. Also use when a message contains a [WAIT:<agent>] tag, or to send, wait for, or notify results between agents.
 ---
 
 ## Command Reference

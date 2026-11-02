@@ -129,6 +129,10 @@ tmux-agent spawn --agent coder --dir ~/repo/api coder-2 "Fix the lint errors"
 already running, `spawn` just sends it the task. A window holds up to 4 panes; after that, new
 windows are opened (change the limit with `TMUX_AGENT_MAX_PANES`).
 
+If a spawned agent exits any other way than `tmux-agent quit` (a double Ctrl-C, Ctrl-D, `/quit`, a
+crash), its pane stays open with a shell and the agent is unregistered. Run `tmux-agent new <agent>`
+there to start an agent in the same pane.
+
 ### Talk between agents
 
 ```bash

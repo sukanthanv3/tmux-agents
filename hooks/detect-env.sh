@@ -29,6 +29,8 @@ if [ -n "$TMUX" ] && [ -n "$TMUX_PANE" ]; then
     echo "My Agent Name: ${MY_AGENT:-(not registered)}"
     echo "Peer Agents: ${PEERS:-(none)}"
     echo "Messaging: tmux-agent send <agent> \"<msg>\" | tmux-agent notify <agent> \"<result>\""
+    echo "Runtime: you are running inside the tmux-agent runtime."
+    echo "Spawnable Agents: defined in ~/.kiro/agents/*.json (name + description per file)"
   fi
 elif [ -n "$STY" ]; then
   echo "Shell Type: GNU screen session ($STY)"
