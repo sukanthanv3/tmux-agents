@@ -174,6 +174,7 @@ tmux-agent spawn jira "..."
 | `TMUX_AGENT_SESSION` | session of the current pane | Which session commands act on |
 | `TMUX_AGENT_MAX_PANES` | `4` | Panes per window before `spawn` opens a new window |
 | `TMUX_AGENT_CMD` | `kiro-cli chat -a --agent` | Command used to launch an agent (agent name is appended) |
+| `TMUX_AGENT_KEEPALIVE` | `1` | When kiro exits for any reason other than `tmux-agent quit` (double Ctrl-C, Ctrl-D, `/quit`, SIGINT), keep the pane and resume the same conversation after 3s. Press `q` during the countdown to close the pane. `0` closes the pane when kiro exits |
 
 `kiro-cli chat -a` trusts every tool. Agents run unattended, so with anything less they would get
 stuck on approval prompts. If you don't want that, override `TMUX_AGENT_CMD`.
