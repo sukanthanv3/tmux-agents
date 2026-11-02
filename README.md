@@ -129,6 +129,10 @@ tmux-agent spawn --agent coder --dir ~/repo/api coder-2 "Fix the lint errors"
 already running, `spawn` just sends it the task. A window holds up to 4 panes; after that, new
 windows are opened (change the limit with `TMUX_AGENT_MAX_PANES`).
 
+If a spawned agent exits any other way than `tmux-agent quit` (a double Ctrl-C, Ctrl-D, `/quit`, a
+crash), its pane stays open with a shell and the agent is unregistered. Run `tmux-agent new <agent>`
+there to start an agent in the same pane.
+
 ### Talk between agents
 
 ```bash
@@ -174,7 +178,6 @@ tmux-agent spawn jira "..."
 | `TMUX_AGENT_SESSION` | session of the current pane | Which session commands act on |
 | `TMUX_AGENT_MAX_PANES` | `4` | Panes per window before `spawn` opens a new window |
 | `TMUX_AGENT_CMD` | `kiro-cli chat -a --agent` | Command used to launch an agent (agent name is appended) |
-| `TMUX_AGENT_KEEPALIVE` | `1` | When kiro exits for any reason other than `tmux-agent quit` (double Ctrl-C, Ctrl-D, `/quit`, SIGINT), keep the pane and resume the same conversation after 3s. Press `q` during the countdown to close the pane. `0` closes the pane when kiro exits |
 
 `kiro-cli chat -a` trusts every tool. Agents run unattended, so with anything less they would get
 stuck on approval prompts. If you don't want that, override `TMUX_AGENT_CMD`.

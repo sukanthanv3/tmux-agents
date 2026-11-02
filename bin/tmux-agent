@@ -158,12 +158,16 @@ cmd_start() {
 # create_agent_pane <agent> <dir> <kiro-agent> [first prompt]  -> prints pane id
 #   Splits the caller's window (or the session's current window from
 #   outside); opens a new window once a window holds $MAX_PANES panes or
-#   there is no room to split. The pane closes when the agent exits.
+#   there is no room to split. When the agent exits (Ctrl-C, /quit, crash),
+#   the pane drops to a shell instead of closing, so it can be reused with
+#   `tmux-agent new`. `tmux-agent quit` closes it.
 create_agent_pane() {
     local agent="$1" dir="$2" profile="$3"; shift 3
     local self cmd target pane
     self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
     cmd="$(printf '%q ' "$self" new --agent "$profile" "$agent" "$@")"
+    # shellcheck disable=SC2016  # $SHELL expands in the pane, not here
+    cmd+='; exec "${SHELL:-bash}" -l'
 
     local opts=(-d -P -F '#{pane_id}'
         -e "TMUX_AGENT_SESSION=$SESSION" -e "TMUX_AGENT_NAME=$agent")
@@ -253,7 +257,7 @@ cmd_new() {
     unregister() {
         tmux set-option -p -t "$_TA_PANE" -u @agent 2>/dev/null || true
         tmux set-option -p -t "$_TA_PANE" -u @agent_state 2>/dev/null || true
-        tmux set-option -p -t "$_TA_PANE" -u @agent_quitting 2>/dev/null || true
+        tmux set-option -p -t "$_TA_PANE" -u @agent_spawned 2>/dev/null || true
     }
     trap unregister EXIT
     # A handler (not ignore) so Ctrl-C reaches kiro but doesn't kill us first;
@@ -270,54 +274,9 @@ cmd_new() {
 
     echo "Registered '$agent' -> pane $pane (session $SESSION, kiro agent $profile)" >&2
 
-    run_agent_loop "$agent" "$profile" "$pane" "$@"
-}
-
-# Run kiro and keep the pane alive when it exits unexpectedly.
-#   kiro exits on a double Ctrl-C, Ctrl-D, /quit, or a SIGINT sent to its
-#   process, and its exit code can't tell these apart. Unless the exit was
-#   requested with `tmux-agent quit`, resume the same conversation in the same
-#   pane. Press q during the countdown to close the pane instead.
-#   TMUX_AGENT_KEEPALIVE=0 restores the old behavior (pane closes on exit).
-run_agent_loop() {
-    local agent="$1" profile="$2" pane="$3"; shift 3
-    local rc resume_id="" started quick=0 key first=1
-    while :; do
-        rc=0
-        started=$SECONDS
-        tmux set-option -p -t "$pane" @agent_state running
-        # shellcheck disable=SC2086
-        if [[ -n "$resume_id" ]]; then
-            $AGENT_CMD "$profile" --resume-id "$resume_id" || rc=$?
-        elif (( first )); then
-            $AGENT_CMD "$profile" "$@" || rc=$?    # first prompt is sent once
-        else
-            $AGENT_CMD "$profile" || rc=$?
-        fi
-        first=0
-
-        [[ "$(tmux show-options -p -t "$pane" -qv @agent_quitting 2>/dev/null)" != "1" ]] || break
-        [[ "${TMUX_AGENT_KEEPALIVE:-1}" == "1" ]] || break
-
-        # Stop restarting if kiro keeps dying at startup (bad config, auth...).
-        if (( SECONDS - started < 10 )); then quick=$((quick + 1)); else quick=0; fi
-        if (( quick >= 3 )); then
-            echo "[tmux-agent] '$agent' exited 3 times within 10s (rc=$rc); not restarting." >&2
-            break
-        fi
-
-        # Not "running" during the countdown, so send/notify don't type into it.
-        tmux set-option -p -t "$pane" @agent_state restarting
-        resume_id="$(tmux capture-pane -p -t "$pane" -S -200 2>/dev/null |
-            grep -oE 'resume-id sess_[A-Za-z0-9_-]+' | tail -1 || true)"
-        resume_id="${resume_id#resume-id }"
-        echo >&2
-        echo "[tmux-agent] '$agent' exited (rc=$rc). Restarting in 3s${resume_id:+, resuming $resume_id}." >&2
-        echo "[tmux-agent] Press q to close this pane instead (or use: tmux-agent quit $agent)." >&2
-        key=""
-        read -r -s -n 1 -t 3 key </dev/tty 2>/dev/null || true
-        [[ "$key" != "q" && "$key" != "Q" ]] || break
-    done
+    local rc=0
+    # shellcheck disable=SC2086
+    $AGENT_CMD "$profile" "$@" || rc=$?
     return $rc
 }
 
@@ -529,17 +488,28 @@ cmd_quit() {
     local pane
     pane="$(require_pane_for "$agent")"
 
-    # Tell the keep-alive loop in cmd_new this exit is intentional.
-    tmux set-option -p -t "$pane" @agent_quitting 1
+    # Read before /quit: unregistering on exit clears the flag.
+    local spawned
+    spawned="$(tmux show-options -p -t "$pane" -qv @agent_spawned)"
+
     tmux send-keys -t "$pane" "/quit" Enter
     local i
     for (( i=0; i<10; i++ )); do
-        [[ -z "$(pane_for "$agent")" ]] && { echo "quit $agent"; return 0; }
+        if [[ -z "$(pane_for "$agent")" ]]; then
+            # A spawned pane drops to a shell when the agent exits; close it.
+            if [[ "$spawned" == "1" ]]; then
+                tmux kill-pane -t "$pane" 2>/dev/null || true
+                echo "quit $agent (pane $pane closed)"
+            else
+                echo "quit $agent"
+            fi
+            return 0
+        fi
         sleep 0.5
     done
 
     # Didn't exit cleanly. Spawned panes are disposable: kill them.
-    if [[ "$(tmux show-options -p -t "$pane" -qv @agent_spawned)" == "1" ]]; then
+    if [[ "$spawned" == "1" ]]; then
         tmux kill-pane -t "$pane"
         echo "quit $agent (pane $pane killed)"
         return 0
